@@ -39,20 +39,34 @@ def ask_gemini_sql(user_query: str):
         raise Exception(f"Gemini API Hatası: {str(e)}")
 
 def ask_gemini_recovery(recovery_prompt: str):
-    """Gecikmeler için JSON formatında aksiyon planı üretir."""
+    """Gecikmeler için JSON formatında çoklu aksiyon üretir."""
     response_schema = {
         "type": "OBJECT",
         "properties": {
             "reason": {"type": "STRING"},
-            "action": {"type": "STRING"}
+            "actions": {
+                "type": "ARRAY",
+                "items": {"type": "STRING"}
+            },
+            "priority": {"type": "STRING"}
         },
-        "required": ["reason", "action"]
+        "required": ["reason", "actions", "priority"]
     }
 
     try:
         response = client.models.generate_content(
             model=CURRENT_MODEL,
-            contents=f"Lojistik risk analizi yap ve JSON döndür: {recovery_prompt}",
+            contents=f"""
+Sen bir lojistik AI aksiyon motorusun.
+
+Görev:
+- Sorunu analiz et
+- 3 ila 5 tane aksiyon öner
+- Kısa ve operasyonel ol
+
+Format JSON olmalı:
+{recovery_prompt}
+""",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=response_schema
