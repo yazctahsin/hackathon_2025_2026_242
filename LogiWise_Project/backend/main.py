@@ -1,18 +1,22 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from database import create_db_and_tables, get_session
 from models import Order, Shipment
 from sqlmodel import select
-from sqlalchemy import text
-from datetime import date
+from datetime import datetime, date
 import json
+from notification import router as notification_router
+from ai_service import (
+    ask_gemini_recovery,
+    ask_gemini_summary
+)
 
-# ai_service dosyasından gerekli fonksiyonları çağırıyoruz
-from ai_service import ask_gemini_sql, ask_gemini_recovery, ask_gemini_summary
+app = FastAPI(title="SevkAI / LogiWise PRO API")
 
-app = FastAPI(title="SevkAI / LogiWise API")
+app.include_router(notification_router)
 
-# --- CORS AYARI ---
+# ---------------- CORS ----------------
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,173 +25,201 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------- STATUS MAP ----------------
 
-def calculate_risk_level(eta_date, current_date=date(2026, 5, 9)):
-    """Basit risk skorlama sistemi"""
+STATUS_MAP = {
+    "Sipariş Alındı": 0,
+    "Alındı": 0,
+    "Hazırlanıyor": 1,
+    "Kargoda": 2,
+    "Teslim": 3,
+    "Teslim Edildi": 3
+}
+
+# ---------------- RISK ENGINE ----------------
+
+def calculate_risk_level(order_status, eta_date, total_amount, current_date=None):
+
+    if current_date is None:
+        current_date = datetime.now()
+
     try:
+
+        if order_status in ["Teslim", "Teslim Edildi"]:
+            return "LOW", 0
+
+        if not eta_date:
+            return "MEDIUM", 50
+
+        if isinstance(eta_date, date) and not isinstance(eta_date, datetime):
+            eta_date = datetime.combine(eta_date, datetime.min.time())
+
         delay_days = (current_date - eta_date).days
-        if delay_days >= 3:
-            return "HIGH"
+
+        risk = 0
+
+        # gecikme
+        if delay_days > 0:
+            risk += 70
+        if delay_days >= 7:
+            risk += 50
+        elif delay_days >= 3:
+            risk += 30
         elif delay_days >= 1:
-            return "MEDIUM"
+            risk += 15
+
+        # status
+        if order_status == "Kargoda":
+            risk += 30
+        elif order_status == "Hazırlanıyor":
+            risk += 40
+
+        # amount
+        if total_amount >= 5000:
+            risk += 25
+        elif total_amount >= 2000:
+            risk += 15
+
+        # HARD RULE
+        if delay_days >= 5 and order_status != "Teslim Edildi":
+            risk = 100
+
+        # 🔥 CLAMP (EN KRİTİK FIX)
+        risk = max(0, min(100, risk))
+
+        if risk >= 75:
+            return "HIGH", risk
+        elif risk >= 40:
+            return "MEDIUM", risk
         else:
-            return "LOW"
-    except:
-        return "LOW"
+            return "LOW", risk
+
+    except Exception as e:
+        print("RISK ERROR:", e)
+        return "LOW", 0
 
 
 @app.on_event("startup")
-def on_startup():
+def startup():
     create_db_and_tables()
 
 
-@app.get("/")
-def read_root():
-    return {"message": "SevkAI Backend Sistemi Online!", "status": "running"}
-
-
-# --- SİPARİŞLERİ GETİR ---
 @app.get("/orders")
 def get_orders(session=Depends(get_session)):
-    statement = select(Order)
-    orders = session.exec(statement).all()
 
-    status_map = {
-        "Sipariş Alındı": 0,
-        "Hazırlanıyor": 1,
-        "Kargoda": 2,
-        "Teslim Edildi": 3
-    }
+    orders = session.exec(select(Order)).all()
 
-    enriched = []
+    result = []
+
     for o in orders:
-        shipment = session.exec(select(Shipment).where(Shipment.order_id == o.id)).first()
-        risk = "LOW"
-        if shipment and shipment.eta_date:
-            risk = calculate_risk_level(shipment.eta_date)
 
-        enriched.append({
+        shipment = session.exec(
+            select(Shipment).where(Shipment.order_id == o.id)
+        ).first()
+
+        risk_level, risk_score = calculate_risk_level(
+            o.status,
+            shipment.eta_date if shipment else None,
+            o.total_amount
+        )
+
+        result.append({
             "id": o.id,
             "customer_name": o.customer_name,
             "status": o.status,
-            "current_step": status_map.get(o.status, 0),
+            "current_step": STATUS_MAP.get(o.status, 0),
             "order_date": o.order_date,
             "total_amount": o.total_amount,
-            "risk_level": risk
+            "risk_level": risk_level,
+            "risk_score": risk_score,
+            "tracking_code": shipment.tracking_code if shipment else "N/A"
         })
 
-    return enriched
+    return result
 
 
-# --- GHOST SUPPORT: PROAKTİF AKSİYON UCU (GÜNCELLENDİ) ---
 @app.get("/ghost-support/auto-action")
-def ghost_support_action(session=Depends(get_session)):
-    try:
-        # 1. Adım: Riskli kargoları bulmak için AI'dan SQL al
-        risk_query = "2026-05-09 tarihinden önce teslim edilmesi gereken ama teslim edilmemiş kargoları bul."
-        generated_sql = ask_gemini_sql(risk_query)
+def ghost_support(session=Depends(get_session)):
 
-        result = session.execute(text(generated_sql))
-        results = result.mappings().all()
+    orders = session.exec(select(Order)).all()
 
-        if not results:
-            return {
-                "status": "Safe",
-                "message": "Şu an operasyonel bir risk bulunamadı.",
-                "ai_action": None
-            }
+    high_risk = []
 
-        # 2. Adım: Risk analizini recovery servisine gönder
-        recovery_prompt = (
-            f"Şu kargolar gecikti: {list(results)}. "
-            f"Nedenini analiz et ve JSON formatında şu alanları döndür: "
-            f"'reason' (neden), 'actions' (aksiyon listesi), 'priority' (öncelik)."
+    for o in orders:
+
+        shipment = session.exec(
+            select(Shipment).where(Shipment.order_id == o.id)
+        ).first()
+
+        level, score = calculate_risk_level(
+            o.status,
+            shipment.eta_date if shipment else None,
+            o.total_amount
         )
 
-        ai_response_raw = ask_gemini_recovery(recovery_prompt)
+        if level == "HIGH":
+            high_risk.append({
+                "id": o.id,
+                "customer": o.customer_name,
+                "status": o.status,
+                "risk_score": score
+            })
 
-        # JSON parse işlemi (AI bazen markdown içinde verebilir, ai_service içinde temizlenmediyse dikkat)
-        try:
-            ai_action_data = json.loads(ai_response_raw)
-        except:
-            # Yedek plan: Eğer AI hatalı JSON dönerse manuel oluştur
-            ai_action_data = {
-                "reason": "Genel lojistik aksaklık algılandı.",
-                "actions": ["Müşteri bilgilendirme mesajı gönder"],
-                "priority": "MEDIUM"
-            }
+    if not high_risk:
 
-        formatted_actions = ai_action_data.get("actions", [])
-
-        # 3. Adım: Frontend için zenginleştirilmiş veri dön
         return {
-            "status": "success",
-            "risky_orders_count": len(results),
-            "ai_action": {
-                "reason": ai_action_data.get("reason", "Bilinmeyen gecikme faktörü"),
-                "actions": formatted_actions,
-                "priority": ai_action_data.get("priority", "MEDIUM")
-            },
+            "status": "Safe",
+            "risky_orders_count": 0,
             "ml_risk_analysis": {
-                "score": 82,
-                "factors": [
-                    "Depo Doluluk Oranı: %82",
-                    "Taşıyıcı Gecikmesi: +2 Gün",
-                    "Hava Durumu: Elverişsiz",
-                    "Geçmiş Gecikme Oranı: Yüksek"
-                ]
+                "score": 0,
+                "factors": ["Operasyon stabil"]
             }
         }
-    except Exception as e:
-        return {"status": "Error", "message": str(e)}
+
+    score = min(100, 60 + len(high_risk) * 10)
+
+    prompt = f"""
+    {len(high_risk)} HIGH risk sipariş var.
+
+    {high_risk}
+
+    Aksiyon üret.
+    """
+
+    ai = ask_gemini_recovery(prompt)
+
+    try:
+        ai_data = json.loads(ai)
+    except:
+        ai_data = {
+            "reason": "system fallback",
+            "actions": ["manual check"],
+            "priority": "HIGH"
+        }
+
+    return {
+        "status": "success",
+        "risky_orders_count": len(high_risk),
+        "ai_action": ai_data,
+        "ml_risk_analysis": {
+            "score": score,
+            "factors": [
+                f"High Risk: {len(high_risk)}",
+                "Delay detected",
+                "Operational stress"
+            ]
+        }
+    }
 
 
-# --- YAPAY ZEKA GÜNLÜK ÖZETİ ---
 @app.get("/ai-summary")
-def get_ai_summary(session=Depends(get_session)):
-    try:
-        orders = session.exec(select(Order)).all()
-        shipments = session.exec(select(Shipment)).all()
-        data_context = f"Siparişler: {orders}, Sevkiyatlar: {shipments}"
-        summary = ask_gemini_summary(data_context)
-        return {"summary": summary}
-    except Exception as e:
-        return {"summary": "Özet şu an hazırlanamıyor.", "detail": str(e)}
+def ai_summary(session=Depends(get_session)):
 
+    orders = session.exec(select(Order)).all()
+    shipments = session.exec(select(Shipment)).all()
 
-# --- DEMO VERİ SETİ ---
-@app.get("/setup-demo-data")
-def setup_demo_data(session=Depends(get_session)):
-    try:
-        # Temizlik
-        session.execute(text("DELETE FROM shipment"))
-        session.execute(text("DELETE FROM \"order\""))
-        session.commit()
+    context = f"{orders}\n{shipments}"
 
-        # Örnek 1: Gecikmiş sipariş
-        o1 = Order(customer_name="Ahmet Yılmaz", order_date=date(2026, 5, 5), status="Hazırlanıyor",
-                   total_amount=1500.0)
-        session.add(o1)
-        session.commit()
-        session.refresh(o1)
-
-        s1 = Shipment(order_id=o1.id, tracking_code="TRK-999", eta_date=date(2026, 5, 7),
-                      current_location="Depo Transfer Merkezi")
-        session.add(s1)
-
-        # Örnek 2: Zamanında sipariş
-        o2 = Order(customer_name="Ayşe Demir", order_date=date(2026, 5, 8), status="Kargoda",
-                   total_amount=2450.0)
-        session.add(o2)
-        session.commit()
-        session.refresh(o2)
-
-        s2 = Shipment(order_id=o2.id, tracking_code="TRK-101", eta_date=date(2026, 5, 12),
-                      current_location="Yolda")
-        session.add(s2)
-
-        session.commit()
-        return {"status": "Success", "message": "Demo verileri (gecikme senaryosu dahil) yüklendi!"}
-    except Exception as e:
-        session.rollback()
-        return {"status": "Error", "message": str(e)}
+    return {
+        "summary": ask_gemini_summary(context)
+    }
