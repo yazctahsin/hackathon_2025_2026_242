@@ -15,9 +15,10 @@ CURRENT_MODEL = "gemini-2.5-flash-lite"
 
 # ---------------- SQL ----------------
 
-def ask_gemini_sql(user_query: str):
+def ask_gemini_summary(context: str):
 
-    schema_context = """
+    prompt = f"""
+    Sen LogiWise Risk Detection Agent birimisin. 
     Sen LogiWise Risk Detection Agent birimisin.
 
     Tablolar:
@@ -25,25 +26,27 @@ def ask_gemini_sql(user_query: str):
     - Order (id, customer_name, order_date, status, total_amount, product_name, quantity)
     - Shipment (id, order_id, tracking_code, eta_date, current_location)
 
+    GÖREVİN:
+    1. Kullanıcı talebine göre sadece saf SQLite kodu üret. 
+    2. Bugünün tarihi: 2026-05-09.
+    3. Markdown kullanma, açıklama yapma. Tablo adlarını "Order" şeklinde tırnaklı yaz. 
     Görev:
     - Sadece SQLite query üret
     - Açıklama yazma
     - Markdown kullanma
-    """
+
+"""
 
     try:
         response = client.models.generate_content(
             model=CURRENT_MODEL,
-            contents=f"{schema_context}\nSoru: {user_query}"
+            contents=prompt
         )
 
-        sql = response.text.strip()
-        return sql.replace("```sql", "").replace("```", "").strip()
+        return response.text.strip()
 
     except Exception as e:
-        return f"SQL_ERROR: {str(e)}"
-
-
+        return f"SUMMARY_ERROR: {str(e)}"
 # ---------------- RECOVERY ----------------
 
 def ask_gemini_recovery(prompt: str):

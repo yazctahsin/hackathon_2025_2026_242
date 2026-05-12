@@ -3,7 +3,6 @@ from database import engine
 from models import Order, Product, Shipment
 from datetime import datetime, timedelta
 
-
 def seed_data():
 
     with Session(engine) as session:
@@ -51,7 +50,7 @@ def seed_data():
 
             # HIGH RISK
             Order(
-                customer_name="Ahmet Yılmaz",
+                customer_name="Ahmet Kılsa",
                 total_amount=7200.0,
                 status="Kargoda"
             ),
