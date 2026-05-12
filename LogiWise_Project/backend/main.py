@@ -6,10 +6,7 @@ from sqlmodel import select
 from datetime import datetime, date
 import json
 from notification import router as notification_router
-from ai_service import (
-    ask_gemini_recovery,
-    ask_gemini_summary
-)
+from ai_service import (ask_gemini_recovery, ask_gemini_summary)
 
 app = FastAPI(title="SevkAI / LogiWise PRO API")
 
